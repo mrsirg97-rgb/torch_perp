@@ -2,7 +2,7 @@
 
 ## Status
 
-**v0.1.0 implementation complete.** 9 instructions, 41 Kani proofs, 15 simulator scenarios, TypeScript SDK.
+**v1 shipped.** 10 instructions, **57 Kani proofs**, **19 simulator scenarios**, TypeScript SDK, e2e test on surfpool.
 
 - Program ID: `852yvbSWFCyVLRo8bWUPTiouM5amtw6JxctgS9P4ymdH`
 - Source: `programs/torch_perp/`
@@ -11,7 +11,7 @@
 - Formal proofs: see [verification.md](./verification.md)
 - Anchor 0.32.1, rust edition 2021
 
-**v1 knowingly ships without funding** (cumulative funding stays at 0). Percolator, IMR/MMR, vAMM, TWAP, liquidations are all active. Funding math is the v1.1 addition.
+What's in v1: vAMM perp with IMR/MMR margin, permissionless liquidation with liquidator bonus, percolator A/K proportional scaling for bad debt absorption, TWAP observation ring feeding a classic funding-rate mechanism (premium from mark vs spot TWAP accrues into a cumulative index; settled on close/liquidate/partial-close), partial position close.
 
 ## Goal
 
@@ -30,7 +30,7 @@ The program makes no distinction at the handler level — `initialize_market` ta
 - No cross-margin across markets. Each position is isolated.
 - No hedging mode. One position per user per market.
 - No orderbook. vAMM only.
-- No external oracles. Mark price comes from the vAMM; TWAP index (v1.1 funding) comes from the Raydium CPMM spot pool the market references.
+- No external oracles. Mark price comes from the vAMM; TWAP index for funding comes from the Raydium CPMM spot pool the market references.
 - No governance. Market parameters are immutable per-market once initialized.
 - No frozen-market failure mode. Bad debt beyond the insurance fund is absorbed by percolator-style proportional scaling, not socialized losses nor protocol shutdown.
 
@@ -49,11 +49,16 @@ vAMM price: `quote_reserve / base_reserve`. Moves with every open/close via stan
 TWAP of the spot pool (Raydium or DeepPool) reserves, computed from an on-chain ring buffer of observations. Used for funding rate calculation only — **not** for mark price. Settlement uses vAMM.
 
 ### Funding Rate
-**v1: disabled.** `cumulative_funding_long` and `cumulative_funding_short` stay at 0. `update_funding` advances the TWAP observation ring and bumps `last_funding_slot` but does not accrue funding.
+Classic perp funding with a single cumulative index.
 
-**v1.1 (planned):** classic perp funding. `funding_rate = (mark - index) / index × funding_period_adjustment`. Applied per slot. Longs pay shorts if mark > index, vice versa. Accumulated into `cumulative_funding_*`; positions settle their delta on any operation against them.
+- `premium_scaled = mark_price_scaled - index_price_scaled` (signed, POS_SCALE precision)
+  - `mark_price_scaled = quote_reserve × POS_SCALE / base_reserve` (vAMM price)
+  - `index_price_scaled` = TWAP of the spot pool's reserves across the ring window
+- `update_funding` crank: accrues `premium × slots_elapsed / funding_period_slots` into `cumulative_funding_long`
+- Single-index design: shorts auto-flip sign via signed `base_asset_amount` on settlement. `cumulative_funding_short` is mirrored as a convenience field for downstream readers.
+- Settlement: `funding_owed = base × (cumulative_current - snapshot) / POS_SCALE` applied on close, partial close, and liquidation.
 
-v1 ships without funding because (a) it adds non-trivial fixed-point math that would double the verification surface, (b) mark drift is empirically bounded by arb presence (see `sim/`), and (c) basic leveraged exposure is the core product — funding is an efficiency improvement, not a safety mechanism.
+Per-unit zero-sum verified: `funding_owed(+B, c, s) == -funding_owed(-B, c, s)` exactly. Kani-proven.
 
 ### Insurance Fund
 A SOL pool owned by the program, funded by a fraction of trading fees. First line of defense against bad debt: liquidation shortfalls draw from insurance before any position is touched. If the fund is exhausted, solvency falls to the percolator layer below rather than freezing the market.
@@ -92,7 +97,7 @@ GlobalConfig (singleton)
 
 PerpMarket (one per underlying mint)
 ├── mint: Pubkey               // SPL or Token-2022 mint with a WSOL-paired CPMM pool
-├── spot_pool: Pubkey          // Raydium CPMM (v1) / DeepPool-compatible pool
+├── spot_pool: Pubkey          // Raydium CPMM or DeepPool-compatible pool
 ├── spot_vault_0: Pubkey
 ├── spot_vault_1: Pubkey
 ├── is_wsol_token_0: bool      // pool orientation cache
@@ -138,7 +143,7 @@ PerpPosition (one per user per market)
 ├── bump: u8
 ```
 
-## Instructions (v1)
+## Instructions
 
 ```
 initialize_global_config(fee_rate_bps, insurance_fund_cut_bps)
@@ -177,8 +182,9 @@ liquidate_position()
       Position account closed (rent to position_owner).
 
 update_funding()
-    → Permissionless crank. v1: no-op apart from advancing TWAP observation and
-      bumping last_funding_slot. v1.1 will compute premium from mark vs TWAP.
+    → Permissionless crank. Advances TWAP observation ring, reads oldest-to-
+      newest observation span as the TWAP index, computes premium = mark - index,
+      accrues premium × slots_elapsed / funding_period into cumulative_funding_long.
 
 write_observation()
     → Permissionless crank. Appends new observation to the TWAP ring buffer.
@@ -193,12 +199,12 @@ write_observation()
 - Taker fee on `open_position` and `close_position`: e.g., 10 bps of notional.
 - Fee split: `(1 - insurance_fund_cut_bps)` to protocol (torch), `insurance_fund_cut_bps` to insurance fund.
 
-### Funding (v1.1 design, v1 ships as no-op)
-- `premium = (mark - index) / index`
-- `funding_per_slot = premium / funding_period_slots`
-- Longs pay shorts when premium > 0, vice versa when < 0.
-- No external funds; it's a zero-sum transfer between position holders.
-- **v1:** `cumulative_funding_*` stays at 0. `update_funding` only advances the observation ring. No per-position funding settlement on open/close/liquidate. This is a deliberate scope-narrowing; see the Funding Rate subsection above.
+### Funding
+- Premium: `mark_scaled - index_scaled` where both are POS_SCALE-scaled prices
+- Accrual: `premium × slots_elapsed / funding_period_slots` per `update_funding` call
+- Settlement: applied on close / partial_close / liquidation via `funding_owed`
+- Zero-sum at the per-unit level (Kani-proven)
+- No external funds; internal transfer between position holders via the cumulative index
 
 ### Liquidation
 - Position liquidatable when: `collateral + unrealized_pnl - accrued_funding < maintenance_margin`
@@ -230,7 +236,7 @@ The A/K math handles residual bad debt fairly regardless of underlying — the s
 
 ## Empirical Properties (from `sim/torch_perp_sim.py`)
 
-Full scenario-by-scenario breakdown lives in [sim.md](./sim.md). The simulator runs 15 scenarios ranging from unit tests to Monte Carlo stress, using the same math ported to pure Python. Key findings that shape design choices:
+Full scenario-by-scenario breakdown lives in [sim.md](./sim.md). The simulator runs 19 scenarios ranging from unit tests to Monte Carlo stress to coordinated adversarial squeezes, using the same math ported to pure Python. Key findings that shape design choices:
 
 1. **Protocol is quiet and profitable under realistic conditions.** Scenarios 9, 10, 14 consistently show hundreds of opens, single-digit liquidations, **zero bad debt**, and tens of SOL in fees accruing to the insurance fund. Insurance grows faster than bad-debt events drain it. This is what justifies v1 shipping without funding — basic leveraged exposure + self-compounding safety buffer.
 
@@ -299,9 +305,9 @@ All values are constants in `programs/torch_perp/src/constants.rs` and mirrored 
 | `LIQUIDATION_PENALTY_BPS` | 500 (5%) | Standard bonus to incentivize permissionless liquidation. |
 | `FEE_RATE_BPS` | 10 (0.10%) | Taker fee on open + close. |
 | `INSURANCE_FUND_CUT_BPS` | 5_000 (50%) | Half of fees feed insurance; other half to protocol treasury. |
-| `FUNDING_PERIOD_SLOTS` | 9_000 (~1hr) | v1 unused (funding disabled); reserved for v1.1. |
-| `TWAP_RING_SIZE` | 32 | Ring buffer of 32 observations. |
-| `TWAP_WINDOW_SLOTS` | 1_500 (~10min) | Target smoothing window for funding (v1.1). |
+| `FUNDING_PERIOD_SLOTS` | 9_000 (~1hr) | Denominator in premium accrual. |
+| `TWAP_RING_SIZE` | 32 | Ring buffer of 32 observations, drives funding index. |
+| `TWAP_WINDOW_SLOTS` | 1_500 (~10min) | Target smoothing window for funding index. |
 | `POS_SCALE` | 1e18 | Percolator A/K precision (standard 18-decimal fixed point). |
 | `PRECISION_THRESHOLD` | POS_SCALE / 1_000 | A-index floor before entering DrainOnly. |
 | `MATURED_WARMUP_SLOTS` | 256 (~100s) | Reserve-to-matured PnL conversion delay (percolator H layer). |
@@ -310,7 +316,7 @@ All values are constants in `programs/torch_perp/src/constants.rs` and mirrored 
 
 **Partial close is v2.** v1 closes the full position or liquidates the full position — no partial closes.
 
-## Out of Scope (v1)
+## Out of Scope
 
 - Cross-collateral (one collateral, many positions)
 - Portfolio margin
@@ -319,7 +325,6 @@ All values are constants in `programs/torch_perp/src/constants.rs` and mirrored 
 - Oracle fallbacks
 - Governance
 - Program upgrade path (immutable once deployed)
-- Funding rate (disabled, v1.1 target)
 
 ## Shipped state
 
@@ -327,8 +332,8 @@ All values are constants in `programs/torch_perp/src/constants.rs` and mirrored 
 2. ✅ Contracts: `state.rs`, `contexts.rs`, `errors.rs`, `constants.rs`, `pool.rs`.
 3. ✅ Math: `math.rs` with 11 pure functions, `Option<T>` returns, no Anchor types.
 4. ✅ Handlers: 9 instructions, all `cargo check` clean, `anchor build` passes BPF stack checks (all large accounts boxed).
-5. ✅ Kani proofs: **41 harnesses** over the math layer. All passing. See [verification.md](./verification.md).
-6. ✅ Simulator: `sim/torch_perp_sim.py` — 15 scenarios including Monte Carlo stress, percolator activation, sandwich defense.
+5. ✅ Kani proofs: **57 harnesses** over the math layer. All passing. See [verification.md](./verification.md).
+6. ✅ Simulator: `sim/torch_perp_sim.py` — 19 scenarios including Monte Carlo stress, percolator activation, sandwich defense, funding zero-sum, sustained-premium drain, partial-close symmetry.
 7. ✅ SDK: `packages/sdk/` — 10 files, all 9 transaction builders, quote previews, liquidation scanner, state decoders.
 8. ✅ E2E test: `packages/sdk/tests/test_e2e.ts` — 7-phase surfpool test composing torchsdk (create/bond/migrate) with torch_perp SDK (init/open/close/crank/liquidate). Verifies vAMM isolation from spot DEX trading empirically.
 9. ✅ Program keypairs: `keys/program.json` (`852yvbSWFCyVLRo8bWUPTiouM5amtw6JxctgS9P4ymdH`), `keys/deploy.json`. Deployed on surfpool.
@@ -337,5 +342,4 @@ All values are constants in `programs/torch_perp/src/constants.rs` and mirrored 
 
 - Devnet deployment + devnet integration testing
 - Mainnet deployment (pending audit + bug bounty)
-- v1.1: funding rate math + Kani proofs + sim scenarios
-- v1.2: partial position close, partial liquidation
+- Future exploration (not committed): partial liquidation, cross-margin, observation-buffer tuning based on prod data

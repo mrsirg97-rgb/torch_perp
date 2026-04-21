@@ -10,8 +10,8 @@
 use crate::math::{
     advance_cumulative, check_initial_margin, compute_fee, funding_delta, funding_owed,
     is_above_maintenance, liquidation_penalty_for_notional, mark_price_scaled, position_notional,
-    premium_signed, required_margin, split_fee, twap_price_scaled, unrealized_pnl, vamm_buy_base,
-    vamm_sell_base, POS_SCALE,
+    premium_signed, proportional_entry, required_margin, split_fee, twap_price_scaled,
+    unrealized_pnl, vamm_buy_base, vamm_sell_base, POS_SCALE,
 };
 
 // ============================================================================
@@ -1043,5 +1043,96 @@ fn verify_funding_owed_long_short_symmetry() {
             let short_owed = funding_owed(-base, current, snap).unwrap();
             assert!(long_owed == -short_owed);
         }
+    }
+}
+
+// ============================================================================
+// Partial close (v1.2) — proportional_entry
+// ============================================================================
+
+#[cfg(kani)]
+#[kani::proof]
+fn verify_proportional_entry_formula() {
+    let cases: [(u64, u64, u64); 5] = [
+        (1_000_000_000, 500_000_000, 1_000_000_000), // close 50%
+        (1_000_000_000, 1_000_000_000, 1_000_000_000), // close 100%
+        (1_000_000_000, 1, 1_000_000_000),            // close 1 unit
+        (0, 500_000_000, 1_000_000_000),              // zero entry → zero proportional
+        (u64::MAX, u64::MAX, u64::MAX),                // extreme
+    ];
+    for (entry, closed, total) in cases {
+        let result = proportional_entry(entry, closed, total);
+        let expected = (entry as u128)
+            .checked_mul(closed as u128)
+            .and_then(|p| p.checked_div(total as u128))
+            .and_then(|v| u64::try_from(v).ok());
+        assert!(result == expected);
+    }
+}
+
+#[cfg(kani)]
+#[kani::proof]
+fn verify_proportional_entry_bounded() {
+    // proportional ≤ entry_notional when base_closed ≤ abs_base. Floor rounding
+    // can only make it smaller, so bound is strict for partial closes.
+    let cases: [(u64, u64, u64); 5] = [
+        (1_000_000_000, 500_000_000, 1_000_000_000),
+        (1_000_000_000, 999_999_999, 1_000_000_000),
+        (1_000_000_000, 1, 1_000_000_000),
+        (0, 0, 1),
+        (u64::MAX / 2, u64::MAX / 4, u64::MAX / 2),
+    ];
+    for (entry, closed, total) in cases {
+        if closed <= total {
+            let result = proportional_entry(entry, closed, total).unwrap();
+            assert!(result <= entry);
+        }
+    }
+}
+
+#[cfg(kani)]
+#[kani::proof]
+fn verify_proportional_entry_zero_base_is_none() {
+    // abs_base = 0 → division undefined → None.
+    let cases: [(u64, u64); 3] = [(0, 0), (1_000, 0), (u64::MAX, 1_000)];
+    for (entry, closed) in cases {
+        assert!(proportional_entry(entry, closed, 0).is_none());
+    }
+}
+
+#[cfg(kani)]
+#[kani::proof]
+fn verify_proportional_entry_monotonic_in_closed() {
+    // Larger base_closed → larger-or-equal proportional entry.
+    let entry: u64 = 10_000_000_000;
+    let total: u64 = 1_000_000_000;
+    let pairs: [(u64, u64); 4] = [
+        (0, 1),
+        (1, 1_000),
+        (1_000, 1_000_000),
+        (1_000_000, 1_000_000_000),
+    ];
+    for (smaller, larger) in pairs {
+        let s = proportional_entry(entry, smaller, total).unwrap();
+        let l = proportional_entry(entry, larger, total).unwrap();
+        assert!(s <= l);
+    }
+}
+
+#[cfg(kani)]
+#[kani::proof]
+fn verify_proportional_entry_full_equals_entry() {
+    // When base_closed == abs_base, proportional should equal entry exactly
+    // (no rounding loss at the boundary).
+    let cases: [(u64, u64); 5] = [
+        (0, 1),
+        (1, 1),
+        (1_000_000_000, 1_000_000_000),
+        (u64::MAX / 4, u64::MAX / 4),
+        (u64::MAX / 2, u64::MAX / 2),
+    ];
+    for (entry, total) in cases {
+        let result = proportional_entry(entry, total, total).unwrap();
+        assert!(result == entry);
     }
 }

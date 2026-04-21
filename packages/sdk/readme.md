@@ -1,6 +1,6 @@
 # torchperpsdk
 
-TypeScript SDK for [torch_perp](https://github.com/mrsirg97-rgb/torch_perp) — leveraged perpetual futures on torch tokens. Oracle-free mark via vAMM, TWAP-backed funding (v1.1), percolator-style solvency for bad debt, integer-math parity with on-chain Rust.
+TypeScript SDK for [torch_perp](https://github.com/mrsirg97-rgb/torch_perp) — leveraged perpetual futures on torch tokens. Oracle-free mark via vAMM, TWAP-backed funding, percolator-style solvency for bad debt, integer-math parity with on-chain Rust.
 
 Composes with [torchsdk](https://www.npmjs.com/package/torchsdk) — torch_perp is a *consumer* of torch state, not an extension.
 
@@ -55,11 +55,12 @@ The SDK never signs. Every builder returns `{ instruction, accounts }`; you comp
 | `buildInitializeGlobalConfigInstruction` | authority | One-time protocol init |
 | `buildInitializeMarketInstruction` | anyone | Permissionless per-token market init |
 | `buildOpenPositionInstruction` | user | Open long or short (signed `base_amount`) |
-| `buildClosePositionInstruction` | user | Close full position, settle PnL |
+| `buildClosePositionInstruction` | user | Close full position, settle PnL + funding |
+| `buildPartialClosePositionInstruction` | user | Close a subset (0 < base_to_close < |base_asset_amount|) |
 | `buildDepositCollateralInstruction` | user | Top up margin |
 | `buildWithdrawCollateralInstruction` | user | Withdraw margin (IMR-gated) |
 | `buildLiquidatePositionInstruction` | anyone | Permissionless liquidation w/ bonus |
-| `buildUpdateFundingInstruction` | anyone | Crank: update funding (v1 no-op) + TWAP obs |
+| `buildUpdateFundingInstruction` | anyone | Crank: accrue funding premium, advance TWAP ring |
 | `buildWriteObservationInstruction` | anyone | Crank: TWAP observation |
 
 ### Pure Math (port of `math.rs`)
@@ -161,8 +162,8 @@ for (const c of candidates) {
 - **Deterministic recovery** — market phases Normal → DrainOnly → ResetPending → Normal; no frozen-forever failure mode
 - **No keepers required** — cranks are permissionless and best-effort; protocol works if nobody runs them (just with delayed observations)
 - **Token-2022 native** — composes with torch's transfer-fee flow
-- **Formally verified** — 41 Kani proofs over the math layer (see [verification.md](../../docs/verification.md))
-- **Sim-validated** — 15 scenarios including Monte Carlo stress + percolator activation (see [sim.md](../../docs/sim.md))
+- **Formally verified** — 57 Kani proofs over the math layer (see [verification.md](../../docs/verification.md))
+- **Sim-validated** — 19 scenarios including Monte Carlo stress, percolator activation, funding zero-sum, partial-close symmetry (see [sim.md](../../docs/sim.md))
 
 ## Constants
 
@@ -173,7 +174,7 @@ for (const c of candidates) {
 | Liquidation penalty | 500 bps (5%) | Liquidator bonus |
 | Taker fee | 10 bps (0.10%) | Applied on open + close |
 | Insurance fund cut | 5000 bps (50%) | Of each fee; remainder → protocol treasury |
-| Funding period | 9000 slots (~1hr) | v1: disabled (funding is v1.1) |
+| Funding period | 9000 slots (~1hr) | Denominator in premium accrual |
 | TWAP ring | 32 observations | ~10min window target |
 | POS_SCALE | 1e18 | Percolator A/K precision |
 | PRECISION_THRESHOLD | POS_SCALE / 1000 | DrainOnly trigger |
@@ -192,7 +193,7 @@ cd packages/sdk && npx tsx tests/test_e2e.ts
 ## Links
 
 - [Design](../../docs/design.md) — architecture + parameters + empirical properties
-- [Verification](../../docs/verification.md) — 41 Kani proof harnesses
+- [Verification](../../docs/verification.md) — 57 Kani proof harnesses
 - [Simulator](../../docs/sim.md) — 15 economic scenarios + Monte Carlo stress
 - Program: `852yvbSWFCyVLRo8bWUPTiouM5amtw6JxctgS9P4ymdH`
 - Built on [torch.market](https://torch.market)

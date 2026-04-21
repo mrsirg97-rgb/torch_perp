@@ -231,6 +231,68 @@ export interface ClosePositionParams {
   spot_vault_1: PublicKey | string
 }
 
+// ============================================================================
+// Partial close (v1.2)
+// ============================================================================
+
+export interface PartialClosePositionParams {
+  user: PublicKey | string
+  mint: PublicKey | string
+  base_to_close: bigint | BN // must be 0 < base_to_close < |position.base_asset_amount|
+  min_quote_out?: bigint | BN
+  spot_pool: PublicKey | string
+  spot_vault_0: PublicKey | string
+  spot_vault_1: PublicKey | string
+}
+
+export const buildPartialClosePositionInstruction = async (
+  connection: Connection,
+  params: PartialClosePositionParams,
+): Promise<BuildResult> => {
+  const program = getProgram(connection)
+  const user = toPk(params.user)
+  const mint = toPk(params.mint)
+  const [market] = getPerpMarketPda(mint)
+  const [position] = getPerpPositionPda(market, user)
+  const [globalConfig] = getGlobalConfigPda()
+  const [insuranceVault] = getInsuranceVaultPda(mint)
+
+  const globalConfigInfo = await connection.getAccountInfo(globalConfig, 'confirmed')
+  if (!globalConfigInfo) throw new Error('global_config not initialized')
+  const { decodeGlobalConfig } = await import('./state')
+  const cfg = decodeGlobalConfig(globalConfigInfo.data)
+
+  const baseToClose =
+    params.base_to_close instanceof BN
+      ? params.base_to_close
+      : new BN(params.base_to_close.toString())
+  const minQuote =
+    params.min_quote_out instanceof BN
+      ? params.min_quote_out
+      : new BN((params.min_quote_out ?? 0n).toString())
+
+  const ix = await program.methods
+    .partialClosePosition(baseToClose, minQuote)
+    .accounts({
+      user,
+      market,
+      spotPool: toPk(params.spot_pool),
+      spotVault0: toPk(params.spot_vault_0),
+      spotVault1: toPk(params.spot_vault_1),
+      position,
+      globalConfig,
+      protocolTreasury: cfg.protocol_treasury,
+      insuranceVault,
+      systemProgram: SystemProgram.programId,
+    } as any)
+    .instruction()
+
+  return {
+    instruction: ix,
+    accounts: { market: market.toString(), position: position.toString() },
+  }
+}
+
 export const buildClosePositionInstruction = async (
   connection: Connection,
   params: ClosePositionParams,

@@ -188,6 +188,17 @@ def funding_owed(base_asset_amount: int, cumulative_current: int, cumulative_sna
 
 
 # ============================================================================
+# Partial close math (v1.2)
+# ============================================================================
+
+def proportional_entry(entry_notional: int, base_closed: int, abs_base: int) -> Optional[int]:
+    """Portion of entry_notional attributable to `base_closed` / `abs_base`."""
+    if abs_base == 0:
+        return None
+    return (entry_notional * base_closed) // abs_base
+
+
+# ============================================================================
 # State
 # ============================================================================
 
@@ -444,6 +455,74 @@ def update_funding(market: PerpMarket, slot: int):
             market.cumulative_funding_short = market.cumulative_funding_long
 
     market.last_funding_slot = slot
+
+
+def partial_close_position(market: PerpMarket, pos: PerpPosition, base_to_close: int, slot: int) -> int:
+    """Close a subset of pos. Keeps pos open with reduced base & entry_notional.
+    Returns the lamports paid to the user for this partial close (can be 0)."""
+    assert 0 < base_to_close < pos.abs_base, "base_to_close out of range"
+
+    entry = pos.entry_notional
+    prop_entry = proportional_entry(entry, base_to_close, pos.abs_base)
+    if prop_entry is None:
+        return 0
+
+    if pos.is_long:
+        result = vamm_sell_base(base_to_close, market.base_asset_reserve, market.quote_asset_reserve)
+        quote_received, new_base, new_quote = result
+        market.base_asset_reserve = new_base
+        market.quote_asset_reserve = new_quote
+        realized_pnl = quote_received - prop_entry
+        close_notional = quote_received
+        market.open_interest_long -= base_to_close
+    else:
+        if market.base_asset_reserve <= base_to_close:
+            quote_cost = market.quote_asset_reserve
+            market.base_asset_reserve += base_to_close
+            market.quote_asset_reserve = 1
+        else:
+            quote_cost = (base_to_close * market.quote_asset_reserve) // (market.base_asset_reserve - base_to_close) + 1
+            result = vamm_buy_base(quote_cost, market.base_asset_reserve, market.quote_asset_reserve)
+            _, new_base, new_quote = result
+            market.base_asset_reserve = new_base
+            market.quote_asset_reserve = new_quote
+        realized_pnl = prop_entry - quote_cost
+        close_notional = quote_cost
+        market.open_interest_short -= base_to_close
+
+    # Funding settlement on closed portion only
+    closed_signed = base_to_close if pos.is_long else -base_to_close
+    owed = funding_owed(closed_signed, market.cumulative_funding_long, pos.last_cumulative_funding)
+
+    # K delta for closed portion
+    k_delta = market.k_index - pos.k_snapshot
+    k_portion = (base_to_close * k_delta) // (pos.a_basis_snapshot * POS_SCALE) if pos.a_basis_snapshot > 0 else 0
+
+    total_realized = realized_pnl + k_portion - owed
+
+    fee = compute_fee(abs(close_notional), FEE_RATE_BPS)
+    to_insurance, _to_protocol = split_fee(fee, INSURANCE_FUND_CUT_BPS)
+    market.insurance_balance += to_insurance
+
+    # Update position state
+    if pos.is_long:
+        pos.base_asset_amount -= base_to_close
+    else:
+        pos.base_asset_amount += base_to_close
+    pos.entry_notional = max(0, entry - prop_entry)
+    pos.last_cumulative_funding = market.cumulative_funding_long
+    pos.k_snapshot = market.k_index
+
+    payout = max(0, total_realized - fee)
+    if total_realized < 0:
+        # loss absorbed from collateral ledger
+        loss = -total_realized
+        pos.quote_asset_collateral = max(0, pos.quote_asset_collateral - loss - fee)
+    else:
+        pos.quote_asset_collateral = max(0, pos.quote_asset_collateral - fee)
+
+    market.record_observation(slot)
+    return payout
 
 
 def close_position(market: PerpMarket, pos: PerpPosition, slot: int) -> int:
@@ -1473,6 +1552,39 @@ def scenario_funding_hold_bleeds_capital():
     print(f"  Net of hold: {diff/1e9:+.6f} SOL")
 
 
+def scenario_partial_close():
+    banner("Scenario 19: Partial close — take half off the table, hold the rest")
+    pool = SpotPool(sol_reserves=500 * LAMPORTS_PER_SOL, token_reserves=5_000_000 * 10**6)
+    market = initialize_market(pool, vamm_quote_reserve=500 * LAMPORTS_PER_SOL)
+
+    # Open a long
+    pos = open_position(market, "alice", +1,
+                        collateral=5 * LAMPORTS_PER_SOL,
+                        quote_exposure=20 * LAMPORTS_PER_SOL, slot=100)
+    assert pos is not None
+    entry_base = pos.abs_base
+    entry_notional = pos.entry_notional
+    print(f"  Opened: base={entry_base/1e6:.2f} tok  entry_notional={entry_notional/1e9:.4f} SOL")
+
+    # Partial close: 50%
+    half = entry_base // 2
+    payout1 = partial_close_position(market, pos, half, slot=200)
+    print(f"  After partial close 50%:")
+    print(f"    remaining base={pos.abs_base/1e6:.2f}  remaining entry={pos.entry_notional/1e9:.4f} SOL")
+    print(f"    payout received: {payout1/1e9:.6f} SOL")
+    assert pos.abs_base == entry_base - half, f"expected {entry_base - half}, got {pos.abs_base}"
+    # entry_notional should be ~half (may differ by 1 due to floor rounding)
+    expected_remaining_entry = entry_notional - (entry_notional * half // entry_base)
+    assert pos.entry_notional == expected_remaining_entry, \
+        f"entry_notional mismatch: {pos.entry_notional} vs {expected_remaining_entry}"
+    print("  ✓ base reduced by exactly half, entry_notional scaled proportionally")
+
+    # Now close the remainder via full close
+    final_payout = close_position(market, pos, slot=300)
+    print(f"  Final close payout: {final_payout/1e9:.6f} SOL")
+    print_market_state(market, "final")
+
+
 def scenario_zero_sum_funding():
     banner("Scenario 18: Funding is zero-sum at the per-unit level")
     # Two positions opened through open_position() have asymmetric bases due to
@@ -1623,6 +1735,7 @@ def main():
     scenario_funding_rebalances_imbalanced_oi()
     scenario_funding_hold_bleeds_capital()
     scenario_zero_sum_funding()
+    scenario_partial_close()
     banner("ALL SCENARIOS COMPLETE")
 
 

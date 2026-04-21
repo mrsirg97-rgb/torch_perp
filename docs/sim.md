@@ -10,8 +10,8 @@ Three different tools, three different questions:
 
 | Tool | Question answered |
 |---|---|
-| Kani proofs (41 harnesses) | *"Does the math return correct values for all inputs?"* |
-| Simulator (15 scenarios) | *"Does the protocol survive realistic + adversarial market conditions?"* |
+| Kani proofs (57 harnesses) | *"Does the math return correct values for all inputs?"* |
+| Simulator (19 scenarios) | *"Does the protocol survive realistic + adversarial market conditions?"* |
 | Surfpool e2e | *"Does the full flow work on an actual Solana validator?"* |
 
 ## How to Run
@@ -20,7 +20,7 @@ Three different tools, three different questions:
 python3 sim/torch_perp_sim.py
 ```
 
-No external dependencies. Stdlib only. Runs all 15 scenarios in sequence, prints results inline.
+No external dependencies. Stdlib only. Runs all 19 scenarios in sequence, prints results inline.
 
 ## Architecture
 
@@ -277,6 +277,60 @@ opens=27  closes=19  liquidations=0  bad_debt=0.0000 SOL
 
 ---
 
+### Scenario 16 — Funding rebalances imbalanced OI over time
+
+**What it tests:** Open 4 longs, 0 shorts, no arb. Mark pushed above spot → premium positive → longs accrue funding debt. After 20k slots, close a long and observe the debt paid out via funding settlement.
+
+**Interpretation:** Funding is the economic mechanism that disincentivizes sustained imbalance. Even when no one's arbing the vAMM back to spot, the cost of holding the imbalanced side grows linearly in time. First close paid out zero SOL — funding consumed all the gains plus collateral.
+
+---
+
+### Scenario 17 — Sustained premium bleeds capital
+
+**What it tests:** Single trader opens a long with 2 SOL collateral, holds 100k slots while other longs keep premium positive. Compute funding owed at close.
+
+```
+Victim projected funding owed: 62.312500 SOL
+Victim payout: 0.000000 SOL (collateral was 1.9850)
+Net of hold: -1.985000 SOL
+```
+
+**Interpretation:** Funding at extreme sustained premium drained a 15-SOL-notional position completely. 62 SOL of projected owed funding exceeds the 2 SOL collateral by a wide margin — settlement clamps payout to zero. This is the point of funding: hold through adverse premium and you pay for it.
+
+---
+
+### Scenario 18 — Funding is zero-sum at per-unit level
+
+**What it tests:** Two positions with asymmetric bases (vAMM swap order means long's base ≠ |short's base|). Compute per-unit funding: `funding_owed(+B)` vs `-funding_owed(-B)` for any B.
+
+```
+funding_owed(+1e9) = -21856270
+funding_owed(-1e9) = 21856270
+✓ per-unit zero-sum holds: long and short pay/receive exactly opposite amounts per base unit
+✓ aggregate funding reflects net position exactly
+```
+
+**Interpretation:** The per-unit invariant holds exactly. Aggregate cancellation equals `net_base × cumulative / POS_SCALE` exactly — zero-sum is proven both per-unit and per-aggregate. Kani also proves the per-unit case formally.
+
+---
+
+### Scenario 19 — Partial close symmetry
+
+**What it tests:** Open a long with 20 SOL notional, partial close 50%, verify state math, close the remainder.
+
+```
+Opened: base=192307.69 tok  entry_notional=20.0000 SOL
+After partial close 50%:
+  remaining base=96153.85  remaining entry=10.0000 SOL
+  payout received: 0.185882 SOL
+✓ base reduced by exactly half, entry_notional scaled proportionally
+Final close payout: 4.763725 SOL
+```
+
+**Interpretation:** `base_asset_amount` reduces by exactly the closed amount, `entry_notional` scales proportionally (floor rounding matches the Kani proof), funding/K snapshots reset to current so the remainder accrues from clean. User net: 5 SOL collateral in, ~4.95 SOL out (0.186 + 4.76) — difference is 2× fees + rounding.
+
+---
+
 ## Composite Findings
 
 ### Finding 1: torch_perp is quiet and profitable under realistic conditions
@@ -321,7 +375,7 @@ Torch_perp's answer: **accept the slippage exists, cover it with insurance first
 
 ## What the Sim Does Not Cover
 
-- **Funding rate dynamics** (v1 ships with funding disabled; v1.1 will add funding-specific scenarios)
+- **Asymmetric funding-rate dynamics** — current scenarios 16-18 exercise funding on imbalanced OI + sustained-premium drains + zero-sum symmetry, but do not exhaust every edge case (e.g., extreme TWAP manipulation across observation-ring wraparound)
 - **Multi-market cross-position interactions** (v1 has isolated-per-market positions only)
 - **On-chain tx ordering / MEV** (the sim runs atomic operations; real chain has priority fees + sandwich MEV)
 - **Fee revenue sustainability at scale** (200 SOL pools in the sim are realistic but small; TVL-at-scale behavior is extrapolated)

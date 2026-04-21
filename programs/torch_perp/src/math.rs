@@ -275,3 +275,30 @@ pub fn funding_owed(
         .checked_div(POS_SCALE as i128)?;
     i64::try_from(owed_i128).ok()
 }
+
+// ==============================================================================
+// Partial close (v1.2)
+// ==============================================================================
+
+// Portion of a position's entry_notional attributable to `base_closed` units.
+// proportional = entry_notional × base_closed / abs_base  (floor).
+//
+// Used for partial-close PnL: realized_pnl on the closed portion is
+//   (quote_realized - proportional)           for a long close
+//   (proportional - quote_cost)               for a short close
+//
+// The remaining position keeps entry_notional -= proportional so that the
+// next close computes PnL against the unrealized portion only.
+pub fn proportional_entry(
+    entry_notional: u64,
+    base_closed: u64,
+    abs_base: u64,
+) -> Option<u64> {
+    if abs_base == 0 {
+        return None;
+    }
+    let result = (entry_notional as u128)
+        .checked_mul(base_closed as u128)?
+        .checked_div(abs_base as u128)?;
+    u64::try_from(result).ok()
+}

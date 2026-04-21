@@ -732,6 +732,158 @@
       ]
     },
     {
+      "name": "partial_close_position",
+      "discriminator": [
+        106,
+        26,
+        50,
+        113,
+        166,
+        181,
+        13,
+        99
+      ],
+      "accounts": [
+        {
+          "name": "user",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "position"
+          ]
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  101,
+                  114,
+                  112,
+                  95,
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.mint",
+                "account": "PerpMarket"
+              }
+            ]
+          },
+          "relations": [
+            "position"
+          ]
+        },
+        {
+          "name": "spot_pool"
+        },
+        {
+          "name": "spot_vault_0"
+        },
+        {
+          "name": "spot_vault_1"
+        },
+        {
+          "name": "position",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  101,
+                  114,
+                  112,
+                  95,
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "user"
+              }
+            ]
+          }
+        },
+        {
+          "name": "global_config"
+        },
+        {
+          "name": "protocol_treasury",
+          "writable": true
+        },
+        {
+          "name": "insurance_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  115,
+                  117,
+                  114,
+                  97,
+                  110,
+                  99,
+                  101,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.mint",
+                "account": "PerpMarket"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "base_to_close",
+          "type": "u64"
+        },
+        {
+          "name": "min_quote_out",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "update_funding",
       "discriminator": [
         224,

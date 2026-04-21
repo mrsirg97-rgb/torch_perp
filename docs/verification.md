@@ -6,7 +6,7 @@ torch_perp's core math is formally verified with [Kani](https://model-checking.g
 
 This is **not** a security audit. It proves the arithmetic is correct, but does not cover access control, account validation, CPI composition, or economic attacks. See [What Is NOT Verified](#what-is-not-verified) for full scope limitations.
 
-**41 proof harnesses. All passing. Zero failures.**
+**57 proof harnesses. All passing. Zero failures.**
 
 Composed across the torch stack:
 
@@ -14,8 +14,8 @@ Composed across the torch stack:
 |---|---|
 | [torch_market](https://github.com/mrsirg97-rgb/torch_market) | 71 |
 | [deep_pool](https://github.com/mrsirg97-rgb/deep_pool) | 16 |
-| **torch_perp** (this repo) | **41** |
-| **Stack total** | **128 formally verified invariants** |
+| **torch_perp** (this repo) | **57** |
+| **Stack total** | **144 formally verified invariants** |
 
 ---
 
@@ -24,8 +24,8 @@ Composed across the torch stack:
 torch_perp's core arithmetic is formally verified using Kani. Kani exhaustively proves properties hold for **all** valid inputs within constrained ranges — not just sampled test cases. Every proof harness uses concrete values spanning the protocol's operating range (dust → typical → max-scale) to avoid SAT solver explosion on wide-integer arithmetic while still covering the spectrum.
 
 **Tool:** Kani Rust Verifier
-**Target:** `torch_perp` v0.1.0
-**Harnesses:** 41, all passing
+**Target:** `torch_perp` v1.0.0
+**Harnesses:** 57, all passing
 **Source:** `programs/torch_perp/src/kani_proofs.rs`
 **Math under proof:** `programs/torch_perp/src/math.rs`
 
@@ -118,9 +118,9 @@ Kani proofs cover the **pure math layer** — the arithmetic that any handler ca
 - **CPI composition** — interactions with the system program (SOL transfers) or the spot pool (Raydium CPMM / DeepPool) are out of scope
 - **TWAP observation invariants** — the ring buffer write pattern is covered via the per-update `advance_cumulative` math, but cross-observation properties (e.g., window size × slot delta) are not
 - **Percolator state machine** — the `apply_percolator_scaling` function lives inside `handlers/liquidate_position.rs` rather than `math.rs`. Its formula is informal at this layer; in practice, the sim (`sim/torch_perp_sim.py`) validates the percolator behavior across scenarios.
-- **Funding rate** — v1 ships with funding disabled (cumulative funding indices stay at 0). v1.1 will introduce funding math and corresponding Kani proofs.
+- **TWAP ring-scan helper** — `read_twap_index` in the update_funding handler walks the observation ring to find the oldest valid observation. Its math (`twap_price_scaled`) is proven, but the ring-walk itself is handler-level and not part of the pure math layer.
 - **Reentrancy or race conditions** — Solana's single-threaded per-tx execution makes traditional reentrancy impossible, but CPI return-value handling should still be reviewed by audit.
-- **Economic attacks** — sandwich attacks, coordinated squeezes, and adversarial liquidation timing are validated in the simulator (`sim/torch_perp_sim.py`), not in the formal proofs. The sim runs 15 scenarios including Monte Carlo stress across 200+ simulation runs.
+- **Economic attacks** — sandwich attacks, coordinated squeezes, and adversarial liquidation timing are validated in the simulator (`sim/torch_perp_sim.py`), not in the formal proofs. The sim runs 19 scenarios including Monte Carlo stress across 200+ simulation runs.
 
 ## Running the Proofs
 
@@ -130,7 +130,7 @@ Install [Kani](https://model-checking.github.io/kani/install-guide.html), then f
 cargo kani
 ```
 
-Kani will compile the `torch_perp` crate with `cfg(kani)` enabled and run every `#[kani::proof]` harness. All 41 must pass. Failures indicate a real correctness issue in the math (as found once already during torch_perp development — a vAMM rounding direction bug caught by the k-invariant proofs before it could ship).
+Kani will compile the `torch_perp` crate with `cfg(kani)` enabled and run every `#[kani::proof]` harness. All 57 must pass. Failures indicate a real correctness issue in the math (as found during development — a vAMM rounding-direction bug caught by the k-invariant proofs, and a Python vs Rust division-semantics mismatch surfaced by the funding zero-sum proof — both fixed before shipping).
 
 ## Simulator
 
@@ -140,7 +140,7 @@ Complementary to the formal proofs is `sim/torch_perp_sim.py` — a pure-Python 
 python3 sim/torch_perp_sim.py
 ```
 
-15 scenarios cover: basic open/close, leverage enforcement, vAMM roundtrip, liquidation cascades, percolator activation, DrainOnly recovery, sandwich defense, realistic multi-day trading with arb, flash crashes, Monte Carlo across volatility regimes, arb-present vs arb-absent, and three engineered stress scenarios. See inline docstrings for scenario-specific findings.
+19 scenarios cover: basic open/close, leverage enforcement, vAMM roundtrip, liquidation cascades, percolator activation, DrainOnly recovery, sandwich defense, realistic multi-day trading with arb, flash crashes, Monte Carlo across volatility regimes, arb-present vs arb-absent, three engineered stress scenarios, funding rebalancing under imbalanced OI, sustained-premium capital drain, per-unit funding zero-sum verification, and partial-close symmetry. See inline docstrings for scenario-specific findings.
 
 ## Versioning
 

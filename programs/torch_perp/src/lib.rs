@@ -73,6 +73,16 @@ pub mod torch_perp {
         handlers::close_position::handler(ctx, min_quote_out)
     }
 
+    // Close a subset of a position. base_to_close must be strictly less than
+    // |base_asset_amount|; use close_position for full exits.
+    pub fn partial_close_position(
+        ctx: Context<PartialClosePosition>,
+        base_to_close: u64,
+        min_quote_out: u64,
+    ) -> Result<()> {
+        handlers::partial_close_position::handler(ctx, base_to_close, min_quote_out)
+    }
+
     // Add SOL collateral to an existing position.
     pub fn deposit_collateral(
         ctx: Context<DepositCollateral>,

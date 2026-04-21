@@ -154,6 +154,21 @@ export const funding_owed = (
 }
 
 // ============================================================================
+// Partial close (v1.2)
+// ============================================================================
+
+// Portion of a position's entry_notional attributable to `base_closed` units.
+// Floor rounding. Returns null if abs_base == 0.
+export const proportional_entry = (
+  entry_notional: bigint,
+  base_closed: bigint,
+  abs_base: bigint,
+): bigint | null => {
+  if (abs_base === 0n) return null
+  return (entry_notional * base_closed) / abs_base
+}
+
+// ============================================================================
 // Price impact (bps) for a given swap
 // ============================================================================
 

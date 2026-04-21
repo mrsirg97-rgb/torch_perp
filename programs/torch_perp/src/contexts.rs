@@ -167,6 +167,56 @@ pub struct ClosePosition<'info> {
 }
 
 // ==============================================================================
+// PartialClosePosition — close a subset of position, keep remainder open
+// ==============================================================================
+// Same account shape as ClosePosition except no `close = user` — the position
+// account stays alive with reduced base_asset_amount and entry_notional.
+#[derive(Accounts)]
+pub struct PartialClosePosition<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [PERP_MARKET_SEED, market.mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Box<Account<'info, PerpMarket>>,
+
+    /// CHECK: validated against market.spot_pool
+    pub spot_pool: UncheckedAccount<'info>,
+    /// CHECK: validated against market.spot_vault_0
+    pub spot_vault_0: UncheckedAccount<'info>,
+    /// CHECK: validated against market.spot_vault_1
+    pub spot_vault_1: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        seeds = [PERP_POSITION_SEED, market.key().as_ref(), user.key().as_ref()],
+        bump = position.bump,
+        has_one = user,
+        has_one = market,
+    )]
+    pub position: Box<Account<'info, PerpPosition>>,
+
+    pub global_config: Box<Account<'info, GlobalConfig>>,
+
+    /// CHECK: validated against global_config.protocol_treasury
+    #[account(mut)]
+    pub protocol_treasury: SystemAccount<'info>,
+
+    /// CHECK: market's insurance fund vault
+    #[account(
+        mut,
+        seeds = [INSURANCE_VAULT_SEED, market.mint.as_ref()],
+        bump,
+    )]
+    pub insurance_vault: SystemAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+// ==============================================================================
 // DepositCollateral — top up margin on an existing position
 // ==============================================================================
 #[derive(Accounts)]

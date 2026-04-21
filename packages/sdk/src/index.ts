@@ -66,6 +66,7 @@ export {
   premium_signed,
   funding_delta,
   funding_owed,
+  proportional_entry,
 } from './math'
 
 // Quote helpers (previews + liquidation candidates)
@@ -84,6 +85,7 @@ export {
   buildInitializeMarketInstruction,
   buildOpenPositionInstruction,
   buildClosePositionInstruction,
+  buildPartialClosePositionInstruction,
   buildDepositCollateralInstruction,
   buildWithdrawCollateralInstruction,
   buildLiquidatePositionInstruction,
@@ -112,6 +114,7 @@ export type {
   InitializeMarketParams,
   OpenPositionParams,
   ClosePositionParams,
+  PartialClosePositionParams,
   CollateralParams,
   WithdrawCollateralParams,
   LiquidatePositionParams,
