@@ -1,0 +1,27 @@
+{
+  "name": "torchperpsdk",
+  "version": "1.0.0",
+  "description": "sdk for interacting with torch_perp on chain",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "npx tsx tests/test_e2e.ts",
+    "test:sim": "npx tsx tests/test_sim.ts",
+    "test:devnet": "npx tsx tests/test_devnet_e2e.ts",
+    "format": "prettier --write src/"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.32.1",
+    "@solana/spl-token": "^0.4.14",
+    "@solana/web3.js": "^1.98.4",
+    "bs58": "^6.0.0",
+    "torchsdk": "10.7.1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "prettier": "^3.8.3",
+    "typescript": "^6.0.3"
+  },
+  "packageManager": "pnpm@9.10.0+sha512.73a29afa36a0d092ece5271de5177ecbf8318d454ecd701343131b8ebc0c1a91c487da46ab77c8e596d6acf1461e3594ced4becedf8921b074fbd8653ed7051c"
+}
