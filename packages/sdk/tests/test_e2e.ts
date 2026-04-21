@@ -603,16 +603,18 @@ const main = async () => {
   }
 
   // ==========================================================================
-  // Phase 7: Liquidation attempt
+  // Phase 7: Adversarial liquidation — coordinated squeeze forces the path
   // ==========================================================================
-  banner('Phase 7 — Liquidation scenario')
+  banner('Phase 7 — Adversarial liquidation (coordinated squeeze)')
 
-  // Open a max-leverage long, then push mark down via a big counter-short
+  // Strategy: open a max-leverage long, then stack large counter-shorts until
+  // the victim actually crosses maintenance margin. If the first counter-whale
+  // isn't enough, pile on more until liquidation triggers or we hit a price
+  // impact cap.
   const victim = Keypair.generate()
   await fundWallet(connection, funder, victim.publicKey, 10 * LAMPORTS_PER_SOL)
 
   try {
-    // 10x long: 10 SOL notional exposure with 1 SOL collateral. Use small base.
     const VICTIM_BASE = 500_000_000n
     const VICTIM_COLLATERAL = 1n * BigInt(LAMPORTS_PER_SOL)
     const openRes = await buildOpenPositionInstruction(connection, {
@@ -626,38 +628,44 @@ const main = async () => {
       spot_vault_1: spotVault1,
     })
     await sendIx(connection, victim, [openRes.instruction], true)
-    log('  Victim opened max-leverage long')
+    log('  Victim opened 10x long (500M base, 1 SOL collateral)')
 
-    // Counter-whale: large short to push mark down
-    const whale = Keypair.generate()
-    await fundWallet(connection, funder, whale.publicKey, 30 * LAMPORTS_PER_SOL)
-    const whaleBase = -2_000_000_000n
-    const whaleCollateral = 20n * BigInt(LAMPORTS_PER_SOL)
-    const whaleRes = await buildOpenPositionInstruction(connection, {
-      user: whale.publicKey,
-      mint: mintPk,
-      base_amount: whaleBase,
-      collateral_lamports: whaleCollateral,
-      max_price_impact_bps: 5000,
-      spot_pool: spotPool,
-      spot_vault_0: spotVault0,
-      spot_vault_1: spotVault1,
-    })
-    await sendIx(connection, whale, [whaleRes.instruction], true)
-    log('  Counter-whale opened large short → mark pushed down')
+    // Coordinated squeeze: spawn counter-whales until victim is liquidatable
+    // or we can't push mark further without triggering price-impact rejection.
+    let attackers = 0
+    let victimLiquidatable = false
+    for (let i = 0; i < 6 && !victimLiquidatable; i++) {
+      const attacker = Keypair.generate()
+      await fundWallet(connection, funder, attacker.publicKey, 40 * LAMPORTS_PER_SOL)
+      try {
+        const attackRes = await buildOpenPositionInstruction(connection, {
+          user: attacker.publicKey,
+          mint: mintPk,
+          base_amount: -2_000_000_000n,
+          collateral_lamports: 15n * BigInt(LAMPORTS_PER_SOL),
+          max_price_impact_bps: 5000,
+          spot_pool: spotPool,
+          spot_vault_0: spotVault0,
+          spot_vault_1: spotVault1,
+        })
+        await sendIx(connection, attacker, [attackRes.instruction], true)
+        attackers++
+      } catch (e: any) {
+        log(`  attacker #${i + 1} rejected: ${(e.message || '').slice(0, 80)}`)
+        break
+      }
+      const m = await getPerpMarket(connection, mintPk)
+      const p = await getPerpPosition(connection, getPerpMarketPda(mintPk)[0], victim.publicKey)
+      if (m && p) {
+        const info = computePositionInfo(m, p)
+        log(`  after attacker #${i + 1}: victim health=${info.health}  equity=${info.equity_sol.toFixed(4)} SOL`)
+        if (info.health === 'liquidatable') victimLiquidatable = true
+      }
+    }
+    log(`  squeeze depth: ${attackers} counter-whales`)
 
-    // Check victim health
-    const market = await getPerpMarket(connection, mintPk)
-    const victimPos = await getPerpPosition(
-      connection,
-      getPerpMarketPda(mintPk)[0],
-      victim.publicKey,
-    )
-    if (!market || !victimPos) throw new Error('state missing')
-    const info = computePositionInfo(market, victimPos)
-    log(`  Victim health: ${info.health}  equity=${info.equity_sol.toFixed(4)} SOL`)
-
-    if (info.health === 'liquidatable') {
+    if (victimLiquidatable) {
+      const insuranceBefore = (await getPerpMarket(connection, mintPk))?.insurance_balance
       const liqRes = await buildLiquidatePositionInstruction(connection, {
         liquidator: liquidator.publicKey,
         mint: mintPk,
@@ -669,13 +677,79 @@ const main = async () => {
       const liqBalBefore = await connection.getBalance(liquidator.publicKey)
       await sendIx(connection, liquidator, [liqRes.instruction])
       const liqBalAfter = await connection.getBalance(liquidator.publicKey)
-      log(`  Liquidator earned: ${solFmt(liqBalAfter - liqBalBefore)} SOL`)
-      ok('liquidate underwater position', `bonus=${solFmt(liqBalAfter - liqBalBefore)} SOL`)
+      const bonus = liqBalAfter - liqBalBefore
+      const marketAfter = await getPerpMarket(connection, mintPk)
+      const insuranceDelta =
+        Number(marketAfter?.insurance_balance.toString() || '0') -
+        Number(insuranceBefore?.toString() || '0')
+      log(`  Liquidator earned: ${solFmt(bonus)} SOL`)
+      log(`  Insurance delta:   ${solFmt(insuranceDelta)} SOL (negative = insurance covered shortfall)`)
+      log(`  a_index ratio:     ${(Number(marketAfter?.a_index.toString() || '0') / 1e18).toFixed(6)}`)
+      ok('adversarial liquidation executed', `bonus=${solFmt(bonus)} SOL, ${attackers} attackers needed`)
     } else {
-      ok('liquidation gate respected', `victim is ${info.health} (not liquidatable)`)
+      // Even at 6 attackers the victim didn't cross — protocol's defenses are robust
+      ok('victim remained solvent', `${attackers} attackers were not enough to breach MMR`)
     }
   } catch (e: any) {
-    fail('liquidation scenario', e)
+    fail('adversarial liquidation', e)
+  }
+
+  // ==========================================================================
+  // Phase 8: Funding cycle — open, crank, measure accrual
+  // ==========================================================================
+  banner('Phase 8 — Funding mechanics (v1.1)')
+
+  try {
+    // Open a position. Snapshot cumulative funding index at entry.
+    const holder = Keypair.generate()
+    await fundWallet(connection, funder, holder.publicKey, 10 * LAMPORTS_PER_SOL)
+    const holderRes = await buildOpenPositionInstruction(connection, {
+      user: holder.publicKey,
+      mint: mintPk,
+      base_amount: 1_000_000_000n,
+      collateral_lamports: 2n * BigInt(LAMPORTS_PER_SOL),
+      max_price_impact_bps: 2000,
+      spot_pool: spotPool,
+      spot_vault_0: spotVault0,
+      spot_vault_1: spotVault1,
+    })
+    await sendIx(connection, holder, [holderRes.instruction], true)
+    const posPre = await getPerpPosition(connection, getPerpMarketPda(mintPk)[0], holder.publicKey)
+    log(`  Holder opened 1B-base long, funding_snapshot=${posPre?.last_cumulative_funding.toString()}`)
+
+    // Fire update_funding a few times. If slots haven't advanced much between
+    // calls, cumulative_funding_long won't grow — but the observation ring +
+    // premium calc still execute, which is what we're testing.
+    for (let i = 0; i < 3; i++) {
+      const fundRes = await buildUpdateFundingInstruction(connection, {
+        mint: mintPk,
+        spot_pool: spotPool,
+        spot_vault_0: spotVault0,
+        spot_vault_1: spotVault1,
+      })
+      await sendIx(connection, liquidator, [fundRes.instruction], true)
+    }
+
+    const marketAfter = await getPerpMarket(connection, mintPk)
+    const cumFunding = marketAfter?.cumulative_funding_long.toString() || '0'
+    log(`  after 3 cranks: cumulative_funding_long=${cumFunding}`)
+
+    // Close and measure funding settlement on close path
+    const balBefore = await connection.getBalance(holder.publicKey)
+    const closeRes = await buildClosePositionInstruction(connection, {
+      user: holder.publicKey,
+      mint: mintPk,
+      min_quote_out: 0n,
+      spot_pool: spotPool,
+      spot_vault_0: spotVault0,
+      spot_vault_1: spotVault1,
+    })
+    await sendIx(connection, holder, [closeRes.instruction], true)
+    const balAfter = await connection.getBalance(holder.publicKey)
+    log(`  close payout: ${solFmt(balAfter - balBefore)} SOL`)
+    ok('funding cycle executed', `cranks fired, settlement path reached on close`)
+  } catch (e: any) {
+    fail('funding cycle', e)
   }
 
   // ==========================================================================

@@ -8,9 +8,10 @@
 //! at. This mirrors the pattern used by torch_market and deep_pool.
 
 use crate::math::{
-    advance_cumulative, check_initial_margin, compute_fee, is_above_maintenance,
-    liquidation_penalty_for_notional, position_notional, required_margin, split_fee,
-    unrealized_pnl, vamm_buy_base, vamm_sell_base,
+    advance_cumulative, check_initial_margin, compute_fee, funding_delta, funding_owed,
+    is_above_maintenance, liquidation_penalty_for_notional, mark_price_scaled, position_notional,
+    premium_signed, required_margin, split_fee, twap_price_scaled, unrealized_pnl, vamm_buy_base,
+    vamm_sell_base, POS_SCALE,
 };
 
 // ============================================================================
@@ -844,6 +845,203 @@ fn verify_unrealized_pnl_bounded_by_max_notional() {
             let abs_pnl: u64 = if pnl >= 0 { pnl as u64 } else { (-pnl) as u64 };
             let max_notional = if entry > current { entry } else { current };
             assert!(abs_pnl <= max_notional);
+        }
+    }
+}
+
+// ============================================================================
+// Funding rate (v1.1) — mark/index price, premium, accrual, settlement
+// ============================================================================
+
+#[cfg(kani)]
+#[kani::proof]
+fn verify_mark_price_formula() {
+    let cases: [(u128, u128); 5] = [
+        (1_000_000_000_000, 100_000_000_000),        // 100 SOL / 1M tokens
+        (148_000_000_000_000, 200_000_000_000),       // post-migration torch scale
+        (1_000_000, 1),
+        (u128::MAX / POS_SCALE, u128::MAX / POS_SCALE),
+        (1, 1),
+    ];
+    for (base_r, quote_r) in cases {
+        let price = mark_price_scaled(base_r, quote_r);
+        let expected = quote_r.checked_mul(POS_SCALE).and_then(|p| p.checked_div(base_r));
+        assert!(price == expected);
+    }
+}
+
+#[cfg(kani)]
+#[kani::proof]
+fn verify_mark_price_zero_base_is_none() {
+    let cases: [u128; 4] = [0, 1, 1_000_000_000, u128::MAX];
+    for quote_r in cases {
+        assert!(mark_price_scaled(0, quote_r).is_none());
+    }
+}
+
+#[cfg(kani)]
+#[kani::proof]
+fn verify_twap_price_formula() {
+    // Same shape as mark_price but using cumulative deltas.
+    let cases: [(u128, u128); 4] = [
+        (100_000_000_000, 1_000_000_000_000),
+        (1_000, 1_000_000),
+        (1, 1),
+        (u128::MAX / POS_SCALE, u128::MAX / POS_SCALE),
+    ];
+    for (sol_delta, token_delta) in cases {
+        let result = twap_price_scaled(sol_delta, token_delta);
+        let expected = sol_delta.checked_mul(POS_SCALE).and_then(|p| p.checked_div(token_delta));
+        assert!(result == expected);
+    }
+}
+
+#[cfg(kani)]
+#[kani::proof]
+fn verify_twap_zero_token_delta_is_none() {
+    let cases: [u128; 4] = [0, 1, 1_000_000_000, u128::MAX];
+    for sol_delta in cases {
+        assert!(twap_price_scaled(sol_delta, 0).is_none());
+    }
+}
+
+#[cfg(kani)]
+#[kani::proof]
+fn verify_premium_sign_correctness() {
+    // mark == index → zero
+    let cases: [u128; 5] = [0, 1, 1_000_000_000, POS_SCALE, u128::MAX / 2];
+    for v in cases {
+        assert!(premium_signed(v, v) == Some(0));
+    }
+
+    // mark > index → positive
+    let pairs_pos: [(u128, u128); 4] = [
+        (100, 50),
+        (1_000_000_000_000, 999_999_999_999),
+        (POS_SCALE, 1),
+        (u128::MAX / 2, 0),
+    ];
+    for (mark, index) in pairs_pos {
+        let p = premium_signed(mark, index).unwrap();
+        assert!(p > 0);
+    }
+
+    // mark < index → negative
+    let pairs_neg: [(u128, u128); 4] = [
+        (50, 100),
+        (999_999_999_999, 1_000_000_000_000),
+        (1, POS_SCALE),
+        (0, u128::MAX / 2),
+    ];
+    for (mark, index) in pairs_neg {
+        let p = premium_signed(mark, index).unwrap();
+        assert!(p < 0);
+    }
+}
+
+#[cfg(kani)]
+#[kani::proof]
+fn verify_funding_delta_zero_slots_is_zero() {
+    // No time elapsed → no funding accrual, regardless of premium.
+    let premiums: [i128; 5] = [
+        0,
+        1_000_000_000,
+        -1_000_000_000,
+        i128::MAX / 2,
+        i128::MIN / 2,
+    ];
+    let periods: [u64; 3] = [1, 9_000, u64::MAX];
+    for premium in premiums {
+        for period in periods {
+            assert!(funding_delta(premium, 0, period) == Some(0));
+        }
+    }
+}
+
+#[cfg(kani)]
+#[kani::proof]
+fn verify_funding_delta_monotonic_in_elapsed() {
+    // For positive premium, longer elapsed → larger (or equal) delta magnitude.
+    let premium: i128 = 1_000_000_000_000_000; // 0.1% of POS_SCALE
+    let period: u64 = 9_000;
+    let elapsed_pairs: [(u64, u64); 4] = [
+        (0, 1),
+        (1, 100),
+        (100, 1_000),
+        (1_000, 10_000),
+    ];
+    for (smaller, larger) in elapsed_pairs {
+        let d_small = funding_delta(premium, smaller, period).unwrap();
+        let d_large = funding_delta(premium, larger, period).unwrap();
+        assert!(d_small <= d_large);
+    }
+}
+
+#[cfg(kani)]
+#[kani::proof]
+fn verify_funding_delta_zero_period_is_none() {
+    // funding_period_slots = 0 → math undefined → None.
+    let premiums: [i128; 4] = [0, 1_000, -1_000, i128::MAX / 2];
+    for premium in premiums {
+        assert!(funding_delta(premium, 100, 0).is_none());
+    }
+}
+
+#[cfg(kani)]
+#[kani::proof]
+fn verify_funding_owed_zero_delta_is_zero() {
+    // cumulative_current == cumulative_snapshot → no funding owed.
+    let bases: [i64; 5] = [0, 1, -1, 1_000_000_000, -1_000_000_000];
+    let cums: [i128; 4] = [0, 1_000, -1_000, 1_000_000_000_000];
+    for base in bases {
+        for cum in cums {
+            assert!(funding_owed(base, cum, cum) == Some(0));
+        }
+    }
+}
+
+#[cfg(kani)]
+#[kani::proof]
+fn verify_funding_owed_sign_correctness() {
+    // Long (base > 0) with positive delta → pays (positive owed).
+    // Long with negative delta → receives (negative owed).
+    // Short (base < 0) flips these.
+    let long_base: i64 = 1_000_000;
+    let short_base: i64 = -1_000_000;
+    let pos_delta_cum: i128 = POS_SCALE as i128; // 1 unit of delta
+    let neg_delta_cum: i128 = -(POS_SCALE as i128);
+
+    let long_pos = funding_owed(long_base, pos_delta_cum, 0).unwrap();
+    assert!(long_pos > 0); // long pays
+
+    let long_neg = funding_owed(long_base, neg_delta_cum, 0).unwrap();
+    assert!(long_neg < 0); // long receives
+
+    let short_pos = funding_owed(short_base, pos_delta_cum, 0).unwrap();
+    assert!(short_pos < 0); // short receives
+
+    let short_neg = funding_owed(short_base, neg_delta_cum, 0).unwrap();
+    assert!(short_neg > 0); // short pays
+}
+
+#[cfg(kani)]
+#[kani::proof]
+fn verify_funding_owed_long_short_symmetry() {
+    // A long of +N and a short of -N at the same cumulative params
+    // must have exactly opposite funding owed (enables zero-sum over OI).
+    let bases: [i64; 4] = [1, 1_000_000, 1_000_000_000, i64::MAX / 2];
+    let snap: i128 = 0;
+    let currents: [i128; 4] = [
+        POS_SCALE as i128,
+        -(POS_SCALE as i128),
+        (POS_SCALE as i128) / 100,
+        -(POS_SCALE as i128) / 100,
+    ];
+    for base in bases {
+        for current in currents {
+            let long_owed = funding_owed(base, current, snap).unwrap();
+            let short_owed = funding_owed(-base, current, snap).unwrap();
+            assert!(long_owed == -short_owed);
         }
     }
 }

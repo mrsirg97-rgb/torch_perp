@@ -5,8 +5,8 @@ use crate::contexts::LiquidatePosition;
 use crate::errors::TorchPerpError;
 use crate::handlers::write_observation::record_observation;
 use crate::math::{
-    is_above_maintenance, liquidation_penalty_for_notional, position_notional, unrealized_pnl,
-    vamm_buy_base, vamm_sell_base,
+    funding_owed, is_above_maintenance, liquidation_penalty_for_notional, position_notional,
+    unrealized_pnl, vamm_buy_base, vamm_sell_base,
 };
 use crate::pool::verify_and_read_reserves;
 
@@ -116,8 +116,20 @@ pub fn handler(ctx: Context<LiquidatePosition>) -> Result<()> {
         0
     };
 
+    // Funding settlement on liquidation: position still owes accrued funding
+    // through the liquidation event. Signed; reduces (or increases) the
+    // residual claim symmetrically with close_position.
+    let owed = funding_owed(
+        base_i,
+        market.cumulative_funding_long,
+        position.last_cumulative_funding,
+    )
+    .ok_or(TorchPerpError::MathOverflow)?;
+
     let total_realized = realized_pnl_i128
         .checked_add(k_delta_i128)
+        .ok_or(TorchPerpError::MathOverflow)?
+        .checked_sub(owed as i128)
         .ok_or(TorchPerpError::MathOverflow)?;
 
     // Liquidator bonus on current_notional

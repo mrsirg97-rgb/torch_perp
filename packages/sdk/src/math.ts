@@ -10,7 +10,7 @@
  * BigInt throughout to avoid JS Number precision loss on u128 values.
  */
 
-import { BPS_DENOMINATOR } from './constants'
+import { BPS_DENOMINATOR, POS_SCALE } from './constants'
 
 // ============================================================================
 // vAMM swap
@@ -106,6 +106,51 @@ export const is_above_maintenance = (
 ): boolean => {
   if (equity <= 0n) return false
   return equity >= required_margin(notional, maintenance_margin_ratio_bps)
+}
+
+// ============================================================================
+// Funding rate (v1.1)
+// ============================================================================
+//
+// BigInt throughout so long-running cumulatives don't lose precision.
+// BigInt division in JS truncates toward zero — same as Rust checked_div — so
+// long/short symmetry is exact (no Python-style floor-div off-by-one).
+
+export const mark_price_scaled = (base_reserve: bigint, quote_reserve: bigint): bigint | null => {
+  if (base_reserve === 0n) return null
+  return (quote_reserve * POS_SCALE) / base_reserve
+}
+
+export const twap_price_scaled = (
+  cum_sol_delta: bigint,
+  cum_token_delta: bigint,
+): bigint | null => {
+  if (cum_token_delta === 0n) return null
+  return (cum_sol_delta * POS_SCALE) / cum_token_delta
+}
+
+// Signed premium: mark - index. Positive → longs pay shorts.
+export const premium_signed = (mark_scaled: bigint, index_scaled: bigint): bigint =>
+  mark_scaled - index_scaled
+
+export const funding_delta = (
+  premium_scaled: bigint,
+  slots_elapsed: bigint,
+  funding_period_slots: bigint,
+): bigint | null => {
+  if (funding_period_slots === 0n) return null
+  return (premium_scaled * slots_elapsed) / funding_period_slots
+}
+
+// Signed funding owed by a position (positive = pays, negative = receives).
+// Long/short auto-flips via signed base_asset_amount.
+export const funding_owed = (
+  base_asset_amount: bigint,
+  cumulative_current: bigint,
+  cumulative_snapshot: bigint,
+): bigint => {
+  const delta = cumulative_current - cumulative_snapshot
+  return (base_asset_amount * delta) / POS_SCALE
 }
 
 // ============================================================================

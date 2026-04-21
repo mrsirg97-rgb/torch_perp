@@ -194,3 +194,84 @@ pub fn liquidation_penalty_for_notional(
         .checked_div(10_000)?;
     result.try_into().ok()
 }
+
+// ==============================================================================
+// Funding rate (v1.1)
+// ==============================================================================
+//
+// Prices are scaled by POS_SCALE (1e18) so sub-lamport precision survives.
+// mark_price_scaled  = quote_reserve × POS_SCALE / base_reserve
+// index_price_scaled = cum_sol_delta × POS_SCALE / cum_token_delta  (from TWAP)
+// premium_scaled     = mark_scaled - index_scaled                   (signed i128)
+// cumulative_funding accumulates premium_scaled × (slots / funding_period)
+// funding owed by position = base × (cum_current - cum_snapshot) / POS_SCALE
+//
+// Positive premium → mark > index → longs pay shorts (by convention).
+// Positive funding_owed → position pays. Signed `base_asset_amount` auto-flips
+// sign for shorts so the same formula works for both sides.
+
+pub const POS_SCALE: u128 = 1_000_000_000_000_000_000;
+
+// Compute the scaled mark price from vAMM reserves.
+// Returns None on zero base reserve or overflow.
+pub fn mark_price_scaled(base_reserve: u128, quote_reserve: u128) -> Option<u128> {
+    if base_reserve == 0 {
+        return None;
+    }
+    quote_reserve.checked_mul(POS_SCALE)?.checked_div(base_reserve)
+}
+
+// Compute the scaled TWAP price from a pair of cumulative-observation deltas.
+// cum_sol_delta   = new_cum_sol   - old_cum_sol   (cumulative reserve × slot_delta)
+// cum_token_delta = new_cum_token - old_cum_token
+// Returns average price over the window. Slot-delta factors cancel out.
+pub fn twap_price_scaled(cum_sol_delta: u128, cum_token_delta: u128) -> Option<u128> {
+    if cum_token_delta == 0 {
+        return None;
+    }
+    cum_sol_delta.checked_mul(POS_SCALE)?.checked_div(cum_token_delta)
+}
+
+// Signed premium: mark_scaled - index_scaled.
+// Positive means mark is above index (longs will pay funding to shorts).
+pub fn premium_signed(mark_scaled: u128, index_scaled: u128) -> Option<i128> {
+    if mark_scaled >= index_scaled {
+        let diff = mark_scaled - index_scaled;
+        i128::try_from(diff).ok()
+    } else {
+        let diff = index_scaled - mark_scaled;
+        i128::try_from(diff).ok().map(|v| -v)
+    }
+}
+
+// Funding delta to add to cumulative_funding given a premium and elapsed time.
+// delta = premium_scaled × slots_elapsed / funding_period_slots.
+// Returns None on zero funding period or overflow.
+pub fn funding_delta(
+    premium_scaled: i128,
+    slots_elapsed: u64,
+    funding_period_slots: u64,
+) -> Option<i128> {
+    if funding_period_slots == 0 {
+        return None;
+    }
+    premium_scaled
+        .checked_mul(slots_elapsed as i128)?
+        .checked_div(funding_period_slots as i128)
+}
+
+// Signed funding owed by a position given the cumulative index delta since snapshot.
+// owed = base × (cumulative_current - cumulative_snapshot) / POS_SCALE.
+// For long (base > 0): positive result = pays funding; negative = receives.
+// For short (base < 0): sign auto-flips — shorts receive when longs pay.
+pub fn funding_owed(
+    base_asset_amount: i64,
+    cumulative_current: i128,
+    cumulative_snapshot: i128,
+) -> Option<i64> {
+    let delta = cumulative_current.checked_sub(cumulative_snapshot)?;
+    let owed_i128 = (base_asset_amount as i128)
+        .checked_mul(delta)?
+        .checked_div(POS_SCALE as i128)?;
+    i64::try_from(owed_i128).ok()
+}

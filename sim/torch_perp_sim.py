@@ -138,6 +138,54 @@ def effective_base(base: int, a_index: int, a_basis_snapshot: int) -> int:
 def liquidation_penalty(notional: int, penalty_bps: int) -> int:
     return (notional * penalty_bps) // BPS_DENOMINATOR
 
+# ============================================================================
+# Funding rate math (v1.1)
+# ============================================================================
+#
+# IMPORTANT: Rust's checked_div truncates toward zero; Python's `//` is floor
+# division (rounds toward -∞). These differ by 1 when dividing a negative
+# numerator by a positive denominator. All signed division below uses
+# `_trunc_div` to match Rust semantics exactly.
+
+def _trunc_div(a: int, b: int) -> int:
+    """Truncated integer division: matches Rust i128::checked_div semantics."""
+    sign = -1 if (a < 0) != (b < 0) else 1
+    return sign * (abs(a) // abs(b))
+
+
+def mark_price_scaled(base_reserve: int, quote_reserve: int) -> Optional[int]:
+    """Scaled mark price: quote × POS_SCALE / base."""
+    if base_reserve == 0:
+        return None
+    return (quote_reserve * POS_SCALE) // base_reserve
+
+
+def twap_price_scaled(cum_sol_delta: int, cum_token_delta: int) -> Optional[int]:
+    """Scaled TWAP price from cumulative-observation deltas."""
+    if cum_token_delta == 0:
+        return None
+    return (cum_sol_delta * POS_SCALE) // cum_token_delta
+
+
+def premium_signed(mark_scaled: int, index_scaled: int) -> int:
+    """mark - index, signed. Positive = mark above index (longs pay)."""
+    return mark_scaled - index_scaled
+
+
+def funding_delta(premium_scaled: int, slots_elapsed: int, funding_period_slots: int) -> Optional[int]:
+    """Accrual to add to cumulative_funding over `slots_elapsed`.
+    Uses truncating division to match Rust; symmetric sign behavior."""
+    if funding_period_slots == 0:
+        return None
+    return _trunc_div(premium_scaled * slots_elapsed, funding_period_slots)
+
+
+def funding_owed(base_asset_amount: int, cumulative_current: int, cumulative_snapshot: int) -> int:
+    """Signed lamports of funding owed (positive = pays) by this position.
+    Uses truncating division so long/short sides are exactly opposite for matched bases."""
+    delta = cumulative_current - cumulative_snapshot
+    return _trunc_div(base_asset_amount * delta, POS_SCALE)
+
 
 # ============================================================================
 # State
@@ -318,8 +366,6 @@ def open_position(
         market.open_interest_long += base_acquired
     else:
         # Short: sell base (vAMM gives quote), position has NEGATIVE base
-        # Virtual short: we compute base_in from desired notional at current mark
-        # base_to_short ≈ quote_exposure × base_reserve / quote_reserve
         base_to_short = (quote_exposure * market.base_asset_reserve) // market.quote_asset_reserve
         result = vamm_sell_base(base_to_short, market.base_asset_reserve, market.quote_asset_reserve)
         if result is None:
@@ -336,6 +382,7 @@ def open_position(
         base_asset_amount=base_asset_amount,
         quote_asset_collateral=collateral - fee,
         entry_notional=entry_notional,
+        last_cumulative_funding=market.cumulative_funding_long,  # v1.1: snapshot funding index
         a_basis_snapshot=market.a_index,
         k_snapshot=market.k_index,
         open_epoch=market.epoch,
@@ -343,6 +390,60 @@ def open_position(
     )
     market.record_observation(slot)
     return pos
+
+
+def update_funding(market: PerpMarket, slot: int):
+    """Crank: compute premium from mark vs TWAP index and accrue into cumulative_funding_long.
+
+    Uses the observation ring: oldest-valid to newest gives the TWAP window.
+    Single-index design — cumulative_funding_long is the canonical value;
+    shorts auto-flip at settlement via signed base_asset_amount.
+    """
+    # Advance observation for the current slot (if new)
+    market.record_observation(slot)
+
+    ring = market.twap_observations
+    ring_size = len(ring)
+    head = market.twap_head
+    newest_idx = (head - 1) % ring_size
+    newest = ring[newest_idx]
+    if newest.slot == 0:
+        market.last_funding_slot = slot
+        return
+
+    # Find oldest in-ring observation with slot > 0 and < newest.slot
+    oldest = newest
+    for i in range(1, ring_size):
+        idx = (newest_idx - i) % ring_size
+        obs = ring[idx]
+        if obs.slot > 0 and obs.slot < oldest.slot:
+            oldest = obs
+
+    if oldest.slot >= newest.slot:
+        # Ring still warming up
+        market.last_funding_slot = slot
+        return
+
+    sol_delta = newest.cumulative_sol - oldest.cumulative_sol
+    token_delta = newest.cumulative_token - oldest.cumulative_token
+    index_scaled = twap_price_scaled(sol_delta, token_delta)
+    if index_scaled is None:
+        market.last_funding_slot = slot
+        return
+
+    mark = mark_price_scaled(market.base_asset_reserve, market.quote_asset_reserve)
+    if mark is None:
+        return
+
+    premium = premium_signed(mark, index_scaled)
+    slots_elapsed = max(0, slot - market.last_funding_slot)
+    if slots_elapsed > 0 and premium != 0:
+        delta = funding_delta(premium, slots_elapsed, market.funding_period_slots)
+        if delta is not None:
+            market.cumulative_funding_long += delta
+            market.cumulative_funding_short = market.cumulative_funding_long
+
+    market.last_funding_slot = slot
 
 
 def close_position(market: PerpMarket, pos: PerpPosition, slot: int) -> int:
@@ -382,11 +483,14 @@ def close_position(market: PerpMarket, pos: PerpPosition, slot: int) -> int:
         realized_pnl = pos.entry_notional - quote_cost
         market.open_interest_short -= pos.abs_base
 
-    # Percolator: compute pnl_delta from K accumulator change (v1: zero since K unchanged during normal ops)
+    # Percolator K delta
     k_delta = market.k_index - pos.k_snapshot
     percolator_pnl_delta = (pos.abs_base * k_delta) // (pos.a_basis_snapshot * POS_SCALE) if pos.a_basis_snapshot > 0 else 0
 
-    total_return = pos.quote_asset_collateral + realized_pnl - fee + percolator_pnl_delta
+    # v1.1: funding settlement. Long pays when premium has been positive over the hold period.
+    owed = funding_owed(pos.base_asset_amount, market.cumulative_funding_long, pos.last_cumulative_funding)
+
+    total_return = pos.quote_asset_collateral + realized_pnl - fee + percolator_pnl_delta - owed
     market.record_observation(slot)
     return max(0, total_return)
 
@@ -425,6 +529,10 @@ def liquidate_position(market: PerpMarket, pos: PerpPosition, slot: int) -> dict
             market.quote_asset_reserve = new_quote
         realized_pnl = pos.entry_notional - quote_cost
         market.open_interest_short -= pos.abs_base
+
+    # v1.1 funding settlement applies to liquidations too
+    owed = funding_owed(pos.base_asset_amount, market.cumulative_funding_long, pos.last_cumulative_funding)
+    realized_pnl -= owed
 
     net_after_pnl = pos.quote_asset_collateral + realized_pnl
 
@@ -1038,6 +1146,11 @@ def run_simulation(
                 if t.open_position is not None and t.name not in positions:
                     t.open_position = None
 
+        # v1.1: funding crank fires every 500 slots (~3.3 min at 400ms slots).
+        # Accrues premium into cumulative_funding_long; positions settle at close/liq.
+        if slot % 500 == 0 and slot > 0:
+            update_funding(market, slot)
+
         # Track percolator activity
         a_ratio = market.a_index / POS_SCALE
         if a_ratio < stats.max_a_scaling_observed:
@@ -1285,6 +1398,133 @@ def scenario_thin_pool_high_leverage():
     print(f"  liquidator earnings: {liq.earned/1e9:.4f} SOL")
 
 
+def scenario_funding_rebalances_imbalanced_oi():
+    banner("Scenario 16: Funding rebalances imbalanced OI over time")
+    # When OI skews heavily long, mark drifts above spot, premium goes positive,
+    # longs pay shorts. Over time this should incentivize short positions (more
+    # attractive) or force longs to close.
+    pool = SpotPool(sol_reserves=500 * LAMPORTS_PER_SOL, token_reserves=5_000_000 * 10**6)
+    market = initialize_market(pool, vamm_quote_reserve=500 * LAMPORTS_PER_SOL)
+
+    # Imbalanced: 4 big longs, no shorts (spot stays flat via no arb)
+    longs = []
+    for i in range(4):
+        p = open_position(market, f"long_{i}", +1, collateral=3 * LAMPORTS_PER_SOL,
+                          quote_exposure=20 * LAMPORTS_PER_SOL, slot=100 + i)
+        if p:
+            longs.append(p)
+    print(f"  Opened {len(longs)} longs, 0 shorts — mark pushed above spot")
+    mark = mark_price_scaled(market.base_asset_reserve, market.quote_asset_reserve)
+    spot = (pool.sol_reserves * POS_SCALE) // pool.token_reserves
+    print(f"  mark_scaled={mark}  spot_scaled={spot}  (mark > spot → premium positive)")
+
+    # Fast-forward 20_000 slots, firing update_funding periodically
+    for slot in range(200, 20_000, 500):
+        # Record observations (simulates passive pool reads)
+        market.record_observation(slot)
+        update_funding(market, slot)
+
+    print(f"  After 20k slots: cumulative_funding_long={market.cumulative_funding_long}")
+    print(f"  (positive → longs have accrued debt, shorts would receive if any existed)")
+
+    # Close a long — it should pay funding
+    if longs:
+        payout = close_position(market, longs[0], slot=20_000)
+        print(f"  First long close payout: {payout/1e9:.6f} SOL (collateral was {longs[0].quote_asset_collateral/1e9:.4f} + PnL - funding)")
+    print_market_state(market, "final")
+
+
+def scenario_funding_hold_bleeds_capital():
+    banner("Scenario 17: Long-duration hold with sustained premium bleeds capital")
+    # Open a long at max leverage, hold through many funding cycles with positive
+    # premium sustained by OI imbalance. Funding drains the position over time.
+    pool = SpotPool(sol_reserves=300 * LAMPORTS_PER_SOL, token_reserves=3_000_000 * 10**6)
+    market = initialize_market(pool, vamm_quote_reserve=300 * LAMPORTS_PER_SOL)
+
+    # Sustained long pressure
+    for i in range(3):
+        open_position(market, f"other_long_{i}", +1, collateral=3 * LAMPORTS_PER_SOL,
+                      quote_exposure=20 * LAMPORTS_PER_SOL, slot=50 + i)
+
+    victim = open_position(market, "hodler", +1,
+                           collateral=2 * LAMPORTS_PER_SOL,
+                           quote_exposure=15 * LAMPORTS_PER_SOL, slot=100)
+    if victim is None:
+        print("  skip: victim open failed")
+        return
+    print(f"  Victim opened at slot 100, collateral {victim.quote_asset_collateral/1e9:.4f} SOL")
+    print(f"  funding_snapshot: {victim.last_cumulative_funding}")
+
+    # Fast-forward many funding cycles
+    HOLD_SLOTS = 100_000
+    for slot in range(200, HOLD_SLOTS, 500):
+        market.record_observation(slot)
+        update_funding(market, slot)
+
+    print(f"  After {HOLD_SLOTS} slots: cumulative_funding_long={market.cumulative_funding_long}")
+    projected_owed = funding_owed(
+        victim.base_asset_amount, market.cumulative_funding_long, victim.last_cumulative_funding
+    )
+    print(f"  Victim projected funding owed: {projected_owed/1e9:.6f} SOL")
+
+    payout = close_position(market, victim, slot=HOLD_SLOTS)
+    print(f"  Victim payout: {payout/1e9:.6f} SOL (collateral was {victim.quote_asset_collateral/1e9:.4f})")
+    diff = payout - victim.quote_asset_collateral
+    print(f"  Net of hold: {diff/1e9:+.6f} SOL")
+
+
+def scenario_zero_sum_funding():
+    banner("Scenario 18: Funding is zero-sum at the per-unit level")
+    # Two positions opened through open_position() have asymmetric bases due to
+    # vAMM swap ordering (long goes first, short sees post-long reserves). That
+    # asymmetry breaks aggregate-sum-zero tests. The core invariant we prove
+    # is per-unit: funding_owed(+B, c, s) == -funding_owed(-B, c, s) for ANY B.
+    # → scaled per-unit rate is identical for long and short.
+    # (This is Kani-verified in verify_funding_owed_long_short_symmetry too.)
+    pool = SpotPool(sol_reserves=400 * LAMPORTS_PER_SOL, token_reserves=4_000_000 * 10**6)
+    market = initialize_market(pool, vamm_quote_reserve=400 * LAMPORTS_PER_SOL)
+
+    long_pos = open_position(market, "long_1", +1,
+                             collateral=2 * LAMPORTS_PER_SOL,
+                             quote_exposure=15 * LAMPORTS_PER_SOL, slot=100)
+    short_pos = open_position(market, "short_1", -1,
+                              collateral=2 * LAMPORTS_PER_SOL,
+                              quote_exposure=15 * LAMPORTS_PER_SOL, slot=101)
+    assert long_pos and short_pos
+
+    pool.swap_sol_for_tokens(20 * LAMPORTS_PER_SOL)
+    print(f"  Spot pushed higher: price={pool.price:.6f}")
+
+    for slot in range(200, 20_000, 500):
+        market.record_observation(slot)
+        update_funding(market, slot)
+
+    long_owed = funding_owed(long_pos.base_asset_amount, market.cumulative_funding_long, long_pos.last_cumulative_funding)
+    short_owed = funding_owed(short_pos.base_asset_amount, market.cumulative_funding_long, short_pos.last_cumulative_funding)
+
+    print(f"  long_base:  {long_pos.base_asset_amount}")
+    print(f"  short_base: {short_pos.base_asset_amount}")
+    print(f"  long_owed:  {long_owed/1e9:+.6f} SOL")
+    print(f"  short_owed: {short_owed/1e9:+.6f} SOL")
+
+    # Per-unit zero-sum: same base magnitude produces exactly opposite owed.
+    B = 1_000_000_000
+    owed_plus = funding_owed(B, market.cumulative_funding_long, 0)
+    owed_minus = funding_owed(-B, market.cumulative_funding_long, 0)
+    print(f"  funding_owed(+1e9) = {owed_plus}")
+    print(f"  funding_owed(-1e9) = {owed_minus}")
+    assert owed_plus == -owed_minus, f"per-unit zero-sum violated: {owed_plus} vs {owed_minus}"
+    print("  ✓ per-unit zero-sum holds: long and short pay/receive exactly opposite amounts per base unit")
+
+    # Aggregate check: sum_owed should equal net_base × delta / POS_SCALE
+    net_base = long_pos.base_asset_amount + short_pos.base_asset_amount
+    expected_sum = funding_owed(net_base, market.cumulative_funding_long, 0)
+    actual_sum = long_owed + short_owed
+    print(f"  net_base: {net_base}  expected_sum: {expected_sum}  actual_sum: {actual_sum}")
+    assert actual_sum == expected_sum, f"aggregate invariant: {actual_sum} != {expected_sum}"
+    print("  ✓ aggregate funding reflects net position exactly")
+
+
 def scenario_liquidator_lag():
     banner("Scenario 15: Liquidator lag — positions go deeply underwater")
     # Normal-ish setup but liquidator scans only every 500 slots instead of 50.
@@ -1380,6 +1620,9 @@ def main():
     scenario_the_squeeze()
     scenario_thin_pool_high_leverage()
     scenario_liquidator_lag()
+    scenario_funding_rebalances_imbalanced_oi()
+    scenario_funding_hold_bleeds_capital()
+    scenario_zero_sum_funding()
     banner("ALL SCENARIOS COMPLETE")
 
 

@@ -61,6 +61,11 @@ export {
   check_initial_margin,
   is_above_maintenance,
   compute_price_impact_bps,
+  mark_price_scaled,
+  twap_price_scaled,
+  premium_signed,
+  funding_delta,
+  funding_owed,
 } from './math'
 
 // Quote helpers (previews + liquidation candidates)

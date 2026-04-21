@@ -2,7 +2,7 @@
   "address": "852yvbSWFCyVLRo8bWUPTiouM5amtw6JxctgS9P4ymdH",
   "metadata": {
     "name": "torch_perp",
-    "version": "0.1.0",
+    "version": "1.0.0",
     "spec": "0.1.0",
     "description": "Leveraged perpetual futures on torch tokens. Oracle-free, percolator-style solvency."
   },

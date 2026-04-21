@@ -4,7 +4,7 @@ use crate::constants::*;
 use crate::contexts::ClosePosition;
 use crate::errors::TorchPerpError;
 use crate::handlers::write_observation::record_observation;
-use crate::math::{compute_fee, split_fee, vamm_buy_base, vamm_sell_base};
+use crate::math::{compute_fee, funding_owed, split_fee, vamm_buy_base, vamm_sell_base};
 use crate::pool::verify_and_read_reserves;
 
 // Close a position fully.
@@ -109,8 +109,19 @@ pub fn handler(ctx: Context<ClosePosition>, min_quote_out: u64) -> Result<()> {
         0
     };
 
+    // Funding settlement: position owes (or receives) based on cumulative
+    // delta since snapshot. Positive owed reduces payout; negative increases.
+    let owed = funding_owed(
+        base_i,
+        market.cumulative_funding_long,
+        position.last_cumulative_funding,
+    )
+    .ok_or(TorchPerpError::MathOverflow)?;
+
     let total_realized = realized_pnl_i128
         .checked_add(k_delta_i128)
+        .ok_or(TorchPerpError::MathOverflow)?
+        .checked_sub(owed as i128)
         .ok_or(TorchPerpError::MathOverflow)?;
 
     // Fee on closing notional

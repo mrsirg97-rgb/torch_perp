@@ -190,11 +190,10 @@ pub fn handler(
     }
 
     let current_slot = Clock::get()?.slot;
-    let funding_snapshot = if base_amount > 0 {
-        market.cumulative_funding_long
-    } else {
-        market.cumulative_funding_short
-    };
+    // Single-index funding design: we snapshot cumulative_funding_long for all
+    // positions. At settlement, `funding_owed` multiplies by base_asset_amount
+    // which is signed, so shorts automatically get the opposite sign.
+    let funding_snapshot = market.cumulative_funding_long;
 
     let user_key = ctx.accounts.user.key();
     let market_key = market.key();
