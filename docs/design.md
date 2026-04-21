@@ -64,7 +64,7 @@ Per-unit zero-sum verified: `funding_owed(+B, c, s) == -funding_owed(-B, c, s)` 
 A SOL pool owned by the program, funded by a fraction of trading fees. First line of defense against bad debt: liquidation shortfalls draw from insurance before any position is touched. If the fund is exhausted, solvency falls to the percolator layer below rather than freezing the market.
 
 ### Percolator Solvency Layer
-When bad debt exceeds the insurance fund, torch_perp uses the A/K proportional-scaling math from [@aeyakovenko's percolator research](https://github.com/aeyakovenko/percolator) — thank you for the math. Losses are distributed across active positions via the A and K indices; the market moves through Normal → DrainOnly → ResetPending → Normal recovery phases rather than freezing. Our use of the math is re-verified in torch_perp's context via Kani.
+When bad debt exceeds the insurance fund, torch_perp uses the A/K proportional-scaling math from [@aeyakovenko's percolator research](https://github.com/aeyakovenko/percolator). Losses are distributed across active positions via the A and K indices; the market moves through Normal → DrainOnly → ResetPending → Normal recovery phases rather than freezing. Our use of the math is re-verified in torch_perp's context via Kani.
 
 ## Architecture
 

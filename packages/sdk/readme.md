@@ -158,7 +158,7 @@ for (const c of candidates) {
 - **Oracle-free mark** — vAMM with its own k invariant, independent of spot pool price movements
 - **Permissionless market init** — anyone can open a perp market for any migrated torch token
 - **Insurance fund from fees** — 50% of taker fees compound into per-market insurance; no external capital
-- **Proportional bad-debt absorption** — uses the A/K scaling math from [@aeyakovenko's percolator research](https://github.com/aeyakovenko/percolator) (thank you) to distribute residual losses across active positions
+- **Proportional bad-debt absorption** — uses the A/K scaling math from [@aeyakovenko's percolator research](https://github.com/aeyakovenko/percolator) to distribute residual losses across active positions
 - **Deterministic recovery** — market phases Normal → DrainOnly → ResetPending → Normal; no frozen-forever failure mode
 - **No keepers required** — cranks are permissionless and best-effort; protocol works if nobody runs them (just with delayed observations)
 - **Token-2022 native** — composes with torch's transfer-fee flow
